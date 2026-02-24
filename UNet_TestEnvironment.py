@@ -61,4 +61,3 @@ MODEL_CONFIGS = {
     "U4": dict(convs_per_block=2, depth=4, use_bn=True,  dropout_rate=None),
     "U5": dict(convs_per_block=2, depth=4, use_bn=False, dropout_rate=0.3),
 }
-dropout_rate']}")
