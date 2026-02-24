@@ -61,12 +61,4 @@ MODEL_CONFIGS = {
     "U4": dict(convs_per_block=2, depth=4, use_bn=True,  dropout_rate=None),
     "U5": dict(convs_per_block=2, depth=4, use_bn=False, dropout_rate=0.3),
 }
-
-model     = UNet(**MODEL_CONFIGS[MODEL_ID]).to(device)
-criterion = None  # Defined in Cell 5
-optimizer = None  # Defined in Cell 5
-print(f"✅ U-Net model '{MODEL_ID}' built.")
-print(f"   Depth: {MODEL_CONFIGS[MODEL_ID]['depth']}")
-print(f"   Convs/block: {MODEL_CONFIGS[MODEL_ID]['convs_per_block']}")
-print(f"   BatchNorm: {MODEL_CONFIGS[MODEL_ID]['use_bn']}")
-print(f"   Dropout: {MODEL_CONFIGS[MODEL_ID]['dropout_rate']}")
+dropout_rate']}")
