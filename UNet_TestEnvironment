@@ -1,0 +1,69 @@
+class ConvBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, convs=1, use_bn=False):
+        super().__init__()
+        layers = []
+        for i in range(convs):
+            layers.append(nn.Conv2d(in_ch if i==0 else out_ch, out_ch, 3, padding=1))
+            if use_bn:
+                layers.append(nn.BatchNorm2d(out_ch))
+            layers.append(nn.ReLU(inplace=True))
+        self.block = nn.Sequential(*layers)
+    def forward(self, x):
+        return self.block(x)
+
+class UNet(nn.Module):
+    def __init__(self, in_ch=1, out_ch=1, base_ch=64, depth=4, convs_per_block=1, use_bn=False, dropout_rate=None):
+        super().__init__()
+        self.depth = depth
+        self.encoders = nn.ModuleList()
+        self.pools    = nn.ModuleList()
+        prev_ch = in_ch
+        for d in range(depth):
+            out_chs = base_ch * (2**d)
+            self.encoders.append(ConvBlock(prev_ch, out_chs, convs_per_block, use_bn))
+            self.pools.append(nn.MaxPool2d(2))
+            prev_ch = out_chs
+        self.bottleneck = ConvBlock(prev_ch, prev_ch*2, convs_per_block, use_bn)
+        self.dropout    = nn.Dropout2d(dropout_rate) if dropout_rate else None
+        self.upconvs    = nn.ModuleList()
+        self.decoders   = nn.ModuleList()
+        for d in reversed(range(depth)):
+            in_chs  = base_ch * (2**(d+1))
+            out_chs = base_ch * (2**d)
+            self.upconvs.append(nn.ConvTranspose2d(in_chs, out_chs, 2, stride=2))
+            self.decoders.append(ConvBlock(in_chs, out_chs, convs_per_block, use_bn))
+        self.out = nn.Conv2d(base_ch, out_ch, 1)
+
+    def forward(self, x):
+        skips = []
+        for i in range(self.depth):
+            x = self.encoders[i](x)
+            skips.append(x)
+            x = self.pools[i](x)
+        x = self.bottleneck(x)
+        if self.dropout:
+            x = self.dropout(x)
+        for i in range(self.depth):
+            x = self.upconvs[i](x)
+            x = torch.cat([x, skips[-(i+1)]], dim=1)
+            x = self.decoders[i](x)
+        return torch.sigmoid(self.out(x))
+
+# Model Configs
+MODEL_CONFIGS = {
+    "U0": dict(convs_per_block=1, depth=4, use_bn=False, dropout_rate=None),
+    "U1": dict(convs_per_block=2, depth=4, use_bn=False, dropout_rate=None),
+    "U2": dict(convs_per_block=2, depth=3, use_bn=False, dropout_rate=None),
+    "U3": dict(convs_per_block=2, depth=5, use_bn=False, dropout_rate=None),
+    "U4": dict(convs_per_block=2, depth=4, use_bn=True,  dropout_rate=None),
+    "U5": dict(convs_per_block=2, depth=4, use_bn=False, dropout_rate=0.3),
+}
+
+model     = UNet(**MODEL_CONFIGS[MODEL_ID]).to(device)
+criterion = None  # Defined in Cell 5
+optimizer = None  # Defined in Cell 5
+print(f"✅ U-Net model '{MODEL_ID}' built.")
+print(f"   Depth: {MODEL_CONFIGS[MODEL_ID]['depth']}")
+print(f"   Convs/block: {MODEL_CONFIGS[MODEL_ID]['convs_per_block']}")
+print(f"   BatchNorm: {MODEL_CONFIGS[MODEL_ID]['use_bn']}")
+print(f"   Dropout: {MODEL_CONFIGS[MODEL_ID]['dropout_rate']}")
