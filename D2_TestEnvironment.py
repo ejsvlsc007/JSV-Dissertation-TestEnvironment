@@ -1,5 +1,5 @@
 """
-DECTNet D1: Dual Encoder Network Combined Convolution and CSwin Transformer
+DECTNet D2: Dual Encoder Network Combined Convolution and CSwin Transformer
 for Medical Image Segmentation
 
 Architecture change from DECTNet (dectnet.py):
@@ -590,12 +590,12 @@ class DeepSupHead(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════════
-# 6.  DECTNet D1  (Full Model)
+# 6.  DECTNet D2  (Full Model)
 # ══════════════════════════════════════════════════════════════════
 
 class DECTNet(nn.Module):
     """
-    DECTNet D1: Dual Encoder Network (CNN + CSwin Transformer)
+    DECTNet D2: Dual Encoder Network (CNN + CSwin Transformer)
     for Medical Image Segmentation.
 
     Drop-in replacement for DECTNet (dectnet.py).
@@ -814,4 +814,4 @@ if __name__ == "__main__":
 
     print(f"\nInference output : {pred.shape}")
     print(f"Binary mask      : {mask.shape}")
-    print("\nDECTNet D1 (CSwin) sanity check passed ✓")
+    print("\nDECTNet D2 (CSwin) sanity check passed ✓")
