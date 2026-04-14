@@ -1,4 +1,5 @@
 import os
+import torch
 from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
 
 
@@ -9,8 +10,9 @@ class nnUNetTrainerCustomEpochs(nnUNetTrainer):
     Falls back to 1000 if not set.
     """
 
-    def __init__(self, plans, configuration, fold, dataset_json, **kwargs):
-        super().__init__(plans, configuration, fold, dataset_json, **kwargs)
+    def __init__(self, plans: dict, configuration: str, fold: int,
+                 dataset_json: dict, device: torch.device = torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json, device)
         self.num_epochs = int(os.environ.get("NNUNET_NUM_EPOCHS", 1000))
         self.print_to_log_file(
             f"nnUNetTrainerCustomEpochs: max_num_epochs = {self.num_epochs}"
