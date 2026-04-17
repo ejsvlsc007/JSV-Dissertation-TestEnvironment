@@ -72,21 +72,25 @@ def window_reverse(windows: torch.Tensor, ws: int, H: int, W: int) -> torch.Tens
 
 
 def build_shift_mask(Hp: int, Wp: int, ws: int, device: torch.device) -> torch.Tensor:
-    """Build cyclic-shift attention mask for given padded spatial dims."""
-    shift     = ws // 2
-    img_mask  = torch.zeros(1, Hp, Wp, 1, device=device)
-    h_slices  = (slice(0, -ws), slice(-ws, -shift), slice(-shift, None))
-    w_slices  = (slice(0, -ws), slice(-ws, -shift), slice(-shift, None))
+    """Build cyclic-shift attention mask. Returns (nW, ws², ws²)."""
+    shift    = ws // 2
+    img_mask = torch.zeros(1, Hp, Wp, 1, device=device)
+    h_slices = (slice(0, -ws), slice(-ws, -shift), slice(-shift, None))
+    w_slices = (slice(0, -ws), slice(-ws, -shift), slice(-shift, None))
     cnt = 0
     for sh in h_slices:
         for sw in w_slices:
             img_mask[:, sh, sw, :] = cnt
             cnt += 1
-    mask_windows = window_partition(img_mask, ws).squeeze(-1)   # (nW, ws²)
-    attn_mask    = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
-    attn_mask    = attn_mask.masked_fill(attn_mask != 0, -100.0) \
-                            .masked_fill(attn_mask == 0, 0.0)
-    return attn_mask   # (nW, ws², ws²)
+
+    # window_partition -> (nW, ws, ws, 1)
+    mask_windows = window_partition(img_mask, ws)  # (nW, ws, ws, 1)
+    mask_windows = mask_windows.view(-1, ws * ws)  # (nW, ws²)  ← explicit flatten
+
+    attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)  # (nW, ws², ws²)
+    attn_mask = attn_mask.masked_fill(attn_mask != 0, -100.0) \
+                         .masked_fill(attn_mask == 0,   0.0)
+    return attn_mask  # (nW, ws², ws²)
 
 
 # ---------------------------------------------------------------------------
