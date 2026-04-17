@@ -114,19 +114,29 @@ class WindowAttention(nn.Module):
         """
         Bw, N, C  = x.shape
         ws_actual = int(N ** 0.5)
+        head_dim  = C // self.num_heads
 
-        qkv = self.qkv(x).reshape(Bw, N, 3, self.num_heads, C // self.num_heads)
+        qkv = self.qkv(x).reshape(Bw, N, 3, self.num_heads, head_dim)
         q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
+        # q, k, v: (Bw, num_heads, N, head_dim)
 
-        attn  = (q @ k.transpose(-2, -1)) * self.scale
-        attn  = attn + self.rpb(ws_actual)   # handles interpolation internally
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        # attn: (Bw, num_heads, N, N)
+
+        attn = attn + self.rpb(ws_actual)
 
         if mask is not None:
-            nW   = mask.shape[0]
-            B    = Bw // nW
-            attn = attn.view(B, nW, self.num_heads, N, N) \
-                 + mask.unsqueeze(0).unsqueeze(2)           # (1, nW, 1, N, N)
-            attn = attn.view(Bw, self.num_heads, N, N)
+            # mask: (nW, N, N)
+            # Expand mask to (Bw, num_heads, N, N) by repeating over batch and heads
+            nW         = mask.shape[0]
+            B          = Bw // nW
+            # repeat mask for each sample in batch, then for each head
+            mask_exp   = mask.unsqueeze(0).unsqueeze(1)   # (1, 1, nW, N, N)
+            mask_exp   = mask_exp.expand(B, self.num_heads, nW, N, N)
+            # reshape to match attn: (B*nW, num_heads, N, N)
+            mask_exp   = mask_exp.permute(0, 2, 1, 3, 4).contiguous()
+            mask_exp   = mask_exp.view(Bw, self.num_heads, N, N)
+            attn       = attn + mask_exp
 
         attn = self.attn_drop(F.softmax(attn, dim=-1))
         x    = (attn @ v).transpose(1, 2).reshape(Bw, N, C)
