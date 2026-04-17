@@ -44,10 +44,15 @@ class LePE(nn.Module):
         self.dw = nn.Conv2d(dim, dim, 3, padding=1, groups=dim)
 
     def forward(self, v: torch.Tensor, H: int, W: int) -> torch.Tensor:
-        """v: (B*heads, N, head_dim)"""
-        B_h, N, C = v.shape
-        v2d = v.transpose(1, 2).view(B_h, C, H, W)
-        return (v + self.dw(v2d).flatten(2).transpose(1, 2))
+        """
+        v:   (B_total, N, head_dim)  where N = H * W
+        H,W: spatial dims of the stripe (sp×W for horizontal, H×sp for vertical)
+        """
+        B_total, N, C = v.shape
+        assert N == H * W, f"LePE: N={N} != H*W={H*W}"
+        v2d  = v.transpose(1, 2).reshape(B_total, C, H, W)
+        lepe = self.dw(v2d).reshape(B_total, C, N).transpose(1, 2)
+        return v + lepe
 
 
 # ---------------------------------------------------------------------------
@@ -94,48 +99,42 @@ class CSWinAttention(nn.Module):
     def _stripe_attn(
         self,
         q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-        lepe: LePE, H: int, W: int, horizontal: bool,
+        lepe: LePE, H: int, W: int, sp: int, horizontal: bool,
     ) -> torch.Tensor:
         """
         Attention within stripes.
 
         q/k/v: (B, half_heads, H*W, head_dim)
+        sp:    stripe size (clamped to feature map size by caller)
         Returns: (B, H*W, half_heads * head_dim)
         """
         B, nh, N, d = q.shape
-        sp = self.split_size
 
         if horizontal:
-            # Reshape: (B, nh, H, W, d) → stripes of height sp
-            # Each stripe: all tokens in sp rows × W cols
-            assert H % sp == 0
-            q = q.view(B, nh, H // sp, sp, W, d).permute(0, 2, 1, 3, 4, 5)
-            k = k.view(B, nh, H // sp, sp, W, d).permute(0, 2, 1, 3, 4, 5)
-            v = v.view(B, nh, H // sp, sp, W, d).permute(0, 2, 1, 3, 4, 5)
-            # (B, n_stripes, nh, sp*W, d)
             n_stripes = H // sp
+            q = q.view(B, nh, n_stripes, sp, W, d).permute(0, 2, 1, 3, 4, 5)
+            k = k.view(B, nh, n_stripes, sp, W, d).permute(0, 2, 1, 3, 4, 5)
+            v = v.view(B, nh, n_stripes, sp, W, d).permute(0, 2, 1, 3, 4, 5)
             q = q.reshape(B * n_stripes, nh, sp * W, d)
             k = k.reshape(B * n_stripes, nh, sp * W, d)
             v = v.reshape(B * n_stripes, nh, sp * W, d)
         else:
-            # Vertical stripes: width sp
-            assert W % sp == 0
-            q = q.view(B, nh, H, W // sp, sp, d).permute(0, 3, 1, 2, 4, 5)
-            k = k.view(B, nh, H, W // sp, sp, d).permute(0, 3, 1, 2, 4, 5)
-            v = v.view(B, nh, H, W // sp, sp, d).permute(0, 3, 1, 2, 4, 5)
             n_stripes = W // sp
+            q = q.view(B, nh, H, n_stripes, sp, d).permute(0, 3, 1, 2, 4, 5)
+            k = k.view(B, nh, H, n_stripes, sp, d).permute(0, 3, 1, 2, 4, 5)
+            v = v.view(B, nh, H, n_stripes, sp, d).permute(0, 3, 1, 2, 4, 5)
             q = q.reshape(B * n_stripes, nh, H * sp, d)
             k = k.reshape(B * n_stripes, nh, H * sp, d)
             v = v.reshape(B * n_stripes, nh, H * sp, d)
 
-        # LePE on v before attention
+        # LePE: merge batch+stripes+heads so LePE sees (total, Ns, head_dim)
         Bw, nh2, Ns, d2 = v.shape
-        v_lepe = v.reshape(Bw * nh2, Ns, d2)
+        v_flat = v.reshape(Bw * nh2, Ns, d2)
         if horizontal:
-            v_lepe = lepe(v_lepe, sp, W)
+            v_flat = lepe(v_flat, sp, W)
         else:
-            v_lepe = lepe(v_lepe, H, sp)
-        v_lepe = v_lepe.reshape(Bw, nh2, Ns, d2)
+            v_flat = lepe(v_flat, H, sp)
+        v_lepe = v_flat.reshape(Bw, nh2, Ns, d2)
 
         attn = self.attn_drop(
             F.softmax((q @ k.transpose(-2, -1)) * self.scale, dim=-1)
@@ -155,19 +154,32 @@ class CSWinAttention(nn.Module):
     def forward(self, x: torch.Tensor, H: int, W: int) -> torch.Tensor:
         """x: (B, H*W, dim)"""
         B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim)
+
+        # Clamp split_size to actual feature map dims
+        sp = min(self.split_size, H, W)
+        # Ensure H and W are divisible by sp — pad if needed
+        pad_h = (sp - H % sp) % sp
+        pad_w = (sp - W % sp) % sp
+        if pad_h or pad_w:
+            x = x.view(B, H, W, C)
+            x = F.pad(x, (0, 0, 0, pad_w, 0, pad_h))
+            H = H + pad_h
+            W = W + pad_w
+            x = x.view(B, H * W, C)
+
+        qkv = self.qkv(x).reshape(B, H * W, 3, self.num_heads, self.head_dim)
         q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
-        # q/k/v: (B, num_heads, N, head_dim)
+        # q/k/v: (B, num_heads, H*W, head_dim)
 
         # Split heads: first half → horizontal, second half → vertical
         q_h, q_v = q[:, :self.half_heads], q[:, self.half_heads:]
         k_h, k_v = k[:, :self.half_heads], k[:, self.half_heads:]
         v_h, v_v = v[:, :self.half_heads], v[:, self.half_heads:]
 
-        out_h = self._stripe_attn(q_h, k_h, v_h, self.lepe_h, H, W, horizontal=True)
-        out_v = self._stripe_attn(q_v, k_v, v_v, self.lepe_v, H, W, horizontal=False)
+        out_h = self._stripe_attn(q_h, k_h, v_h, self.lepe_h, H, W, sp, horizontal=True)
+        out_v = self._stripe_attn(q_v, k_v, v_v, self.lepe_v, H, W, sp, horizontal=False)
 
-        out = torch.cat([out_h, out_v], dim=-1)    # (B, N, dim)
+        out = torch.cat([out_h, out_v], dim=-1)    # (B, H*W, dim)
         return self.proj_drop(self.proj(out))
 
 
