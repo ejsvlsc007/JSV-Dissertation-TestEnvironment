@@ -3,32 +3,10 @@ shared/model_base.py
 ====================
 Shared decoder and DualEncoderBase class.
 
-All D1–D7 model files inherit from DualEncoderBase and only need to:
-  1. Define self.cnn_encoder  (pretrained timm backbone)
-  2. Define self.transformer  (SwinEncoder or CSwinEncoder)
-  3. Call super().__init__() after setting those attributes
-
-The decoder, fusion alignment layers, deep supervision heads,
-output head, and Loss class are identical across all variants —
-they live here so they are never duplicated.
-
-DualEncoderBase architecture
------------------------------
-  Input (B, C, H, W)
-    ├─ CNN encoder      → [c1, c2, c3, c4]  (pretrained timm)
-    └─ Transformer enc  → [t1, t2, t3, t4]  (from scratch)
-  Align transformer channels to CNN channels via 1×1 convs
-  Fuse at each scale: fused_i = cnn_i + align_i(transformer_i)
-  UNet decoder with skip connections from fused features
-  Output: (B, 1, H, W) logits
-
-The CNN encoder must expose:
-    .out_channels: list[int]   — [ch_stage1, ch_stage2, ch_stage3, ch_stage4]
-    forward(x) → list[Tensor]  — feature maps at each stage
-
-The transformer must expose:
-    .out_channels: list[int]
-    forward(x) → list[Tensor]
+All D1-D7 model files inherit from DualEncoderBase and only need to:
+  1. Call nn.Module.__init__(self) first
+  2. Define self.cnn_encoder and self.transformer
+  3. Call DualEncoderBase.__init__(self, ...) to build the decoder
 """
 
 import torch
@@ -41,7 +19,7 @@ import torch.nn.functional as F
 # ---------------------------------------------------------------------------
 
 class DecoderBlock(nn.Module):
-    def __init__(self, in_ch: int, skip_ch: int, out_ch: int):
+    def __init__(self, in_ch, skip_ch, out_ch):
         super().__init__()
         self.up   = nn.ConvTranspose2d(in_ch, out_ch, kernel_size=2, stride=2)
         self.conv = nn.Sequential(
@@ -53,7 +31,7 @@ class DecoderBlock(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-    def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
+    def forward(self, x, skip):
         x = self.up(x)
         if x.shape[2:] != skip.shape[2:]:
             x = F.interpolate(x, size=skip.shape[2:],
@@ -62,27 +40,13 @@ class DecoderBlock(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Loss (shared across all model variants)
+# Loss
 # ---------------------------------------------------------------------------
 
 class DualEncoderLoss(nn.Module):
-    """
-    Dice + BCE blend with optional deep supervision.
-
-    Args:
-        dice_weight: blend factor (0 = pure BCE, 1 = pure Dice).
-        aux_weight:  weight for each auxiliary deep supervision loss.
-        pos_weight:  BCEWithLogitsLoss positive-class weight.
-    """
-
     SMOOTH = 1e-5
 
-    def __init__(
-        self,
-        dice_weight: float = 0.5,
-        aux_weight:  float = 0.4,
-        pos_weight:  float = 500.0,
-    ):
+    def __init__(self, dice_weight=0.5, aux_weight=0.4, pos_weight=500.0):
         super().__init__()
         self.dice_weight = dice_weight
         self.aux_weight  = aux_weight
@@ -90,7 +54,7 @@ class DualEncoderLoss(nn.Module):
             pos_weight=torch.tensor([pos_weight])
         )
 
-    def _single(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def _single(self, logits, target):
         bce  = self.bce(logits, target)
         pred = torch.sigmoid(logits)
         inter = (pred * target).sum()
@@ -99,7 +63,7 @@ class DualEncoderLoss(nn.Module):
         )
         return (1 - self.dice_weight) * bce + self.dice_weight * dice
 
-    def forward(self, output, target: torch.Tensor) -> torch.Tensor:
+    def forward(self, output, target):
         if isinstance(output, (list, tuple)):
             main = self._single(output[0], target)
             aux  = sum(self._single(o, target) for o in output[1:])
@@ -107,7 +71,6 @@ class DualEncoderLoss(nn.Module):
         return self._single(output, target)
 
 
-# Alias so model files can do:  from shared.model_base import Loss
 Loss = DualEncoderLoss
 
 
@@ -117,50 +80,42 @@ Loss = DualEncoderLoss
 
 class DualEncoderBase(nn.Module):
     """
-    Base class for all D1–D7 dual-encoder segmentation models.
+    Base class for all D1-D7 dual-encoder segmentation models.
 
-    Subclass usage
-    --------------
+    Correct subclass pattern
+    ------------------------
         class MyModel(DualEncoderBase):
-            def __init__(self, in_channels, img_size, **cfg):
-                # 1. Build CNN encoder
-                self.cnn_encoder = ...     # must have .out_channels list
-                # 2. Build transformer encoder
-                self.transformer = ...     # must have .out_channels list
-                # 3. Call super().__init__()
-                super().__init__(in_channels, img_size, **cfg)
+            def __init__(self, in_channels=3, img_size=256, **cfg):
+                nn.Module.__init__(self)               # MUST be first
+                self.cnn_encoder = ...                 # then assign encoders
+                self.transformer = ...
+                DualEncoderBase.__init__(self,         # then build decoder
+                    in_channels, img_size, **cfg)
 
-    After super().__init__() the following are available:
-        self.align          nn.ModuleList of 1×1 alignment convs
-        self.decoder_blocks nn.ModuleList of DecoderBlocks
-        self.aux_heads      nn.ModuleList of auxiliary output heads
-        self.final_up       ConvTranspose2d for last upsampling
-        self.final_conv     post-upsampling conv block
-        self.head           1×1 output conv
-        self.deep_sup       bool
+    This explicit two-step init is required because DualEncoderBase needs
+    self.cnn_encoder and self.transformer to already exist when it builds
+    the alignment convs and decoder blocks.
     """
 
-    def __init__(
-        self,
-        in_channels: int,
-        img_size:    int,
-        deep_sup:    bool = True,
-        **_,
-    ):
-        super().__init__()
+    def __init__(self, in_channels, img_size, deep_sup=True, **_):
+        # NOTE: do NOT call super().__init__() here — nn.Module.__init__
+        # must have already been called by the subclass before assigning
+        # self.cnn_encoder and self.transformer.
+        # We just build the decoder components using those existing attrs.
+
         self.deep_sup = deep_sup
 
-        cnn_ch   = self.cnn_encoder.out_channels    # [c1, c2, c3, c4]
-        trans_ch = self.transformer.out_channels    # [t1, t2, t3, t4]
+        cnn_ch   = self.cnn_encoder.out_channels   # [c1, c2, c3, c4]
+        trans_ch = self.transformer.out_channels   # [t1, t2, t3, t4]
         n_stages = len(cnn_ch)
 
-        # 1×1 convs to align transformer channels → CNN channels
+        # 1x1 convs to align transformer channels to CNN channels
         self.align = nn.ModuleList([
             nn.Conv2d(tc, cc, 1)
             for tc, cc in zip(trans_ch, cnn_ch)
         ])
 
-        # Decoder — built coarse-to-fine
+        # Decoder — coarse to fine
         dec_in = cnn_ch[-1]
         self.decoder_blocks = nn.ModuleList()
         self.aux_heads      = nn.ModuleList()
@@ -171,7 +126,6 @@ class DualEncoderBase(nn.Module):
             self.aux_heads.append(nn.Conv2d(out_ch, 1, 1))
             dec_in = out_ch
 
-        # Final upsampling to original resolution
         self.final_up   = nn.ConvTranspose2d(dec_in, dec_in // 2, 2, stride=2)
         self.final_conv = nn.Sequential(
             nn.Conv2d(dec_in // 2, dec_in // 2, 3, padding=1, bias=False),
@@ -180,20 +134,19 @@ class DualEncoderBase(nn.Module):
         )
         self.head = nn.Conv2d(dec_in // 2, 1, 1)
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x):
         orig_size = x.shape[2:]
 
-        cnn_feats   = self.cnn_encoder(x)    # [f1, f2, f3, f4] coarse-first
+        cnn_feats   = self.cnn_encoder(x)
         trans_feats = self.transformer(x)
 
-        # Fuse: align transformer → CNN resolution, then add
+        # Fuse: align transformer to CNN resolution then add
         fused = []
         for cf, tf, align in zip(cnn_feats, trans_feats, self.align):
             tf_r = F.interpolate(align(tf), size=cf.shape[2:],
                                  mode="bilinear", align_corners=False)
             fused.append(cf + tf_r)
 
-        # Decode
         x = fused[-1]
         aux_logits = []
         for block, aux_head, skip in zip(
@@ -203,14 +156,14 @@ class DualEncoderBase(nn.Module):
         ):
             x = block(x, skip)
             if self.deep_sup and self.training:
-                aux_up = F.interpolate(
-                    aux_head(x), size=orig_size,
-                    mode="bilinear", align_corners=False,
+                aux_logits.append(
+                    F.interpolate(aux_head(x), size=orig_size,
+                                  mode="bilinear", align_corners=False)
                 )
-                aux_logits.append(aux_up)
 
         x    = self.final_up(x)
-        x    = F.interpolate(x, size=orig_size, mode="bilinear", align_corners=False)
+        x    = F.interpolate(x, size=orig_size,
+                              mode="bilinear", align_corners=False)
         x    = self.final_conv(x)
         main = self.head(x)
 
