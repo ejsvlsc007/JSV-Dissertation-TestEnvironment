@@ -149,7 +149,8 @@ class SwinBlock(nn.Module):
             nn.Linear(int(dim * mlp_ratio), dim),
             nn.Dropout(drop),
         )
-        self.attn_mask = None   # built lazily on first forward
+        self.attn_mask    = None   # built lazily on first forward
+        self._mask_hw     = (-1, -1)  # (Hp, Wp) used to build current mask
 
     def _build_mask(self, H: int, W: int, device: torch.device):
         ws = self.ws
@@ -187,8 +188,9 @@ class SwinBlock(nn.Module):
         if self.shift:
             shift = ws // 2
             x = torch.roll(x, shifts=(-shift, -shift), dims=(1, 2))
-            if self.attn_mask is None or self.attn_mask.shape[0] != (Hp // ws) * (Wp // ws):
+            if self.attn_mask is None or self._mask_hw != (Hp, Wp):
                 self.attn_mask = self._build_mask(Hp, Wp, x.device)
+                self._mask_hw  = (Hp, Wp)
             mask = self.attn_mask
         else:
             mask = None
