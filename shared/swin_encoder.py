@@ -109,13 +109,27 @@ class WindowAttention(nn.Module):
         self.rpb       = RelativePositionBias(window_size, num_heads)
 
     def forward(self, x: torch.Tensor, mask=None) -> torch.Tensor:
-        """x: (B*nW, ws*ws, dim)"""
+        """x: (B*nW, ws*ws, dim)  — ws may be smaller than self.ws when clamped"""
         Bw, N, C = x.shape
+        ws_actual = int(N ** 0.5)   # actual window size from token count
+
         qkv = self.qkv(x).reshape(Bw, N, 3, self.num_heads, C // self.num_heads)
         q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn + self.rpb()
+
+        # RPB: interpolate bias table if actual ws differs from configured ws
+        if ws_actual == self.ws:
+            attn = attn + self.rpb()
+        else:
+            # Interpolate relative position bias to match actual window size
+            rpb_full = self.rpb()   # (1, heads, ws², ws²)
+            rpb_interp = F.interpolate(
+                rpb_full.reshape(1, self.num_heads, self.ws * self.ws,
+                                 self.ws * self.ws),
+                size=(N, N), mode="bilinear", align_corners=False,
+            )
+            attn = attn + rpb_interp
 
         if mask is not None:
             nW   = mask.shape[0]
@@ -172,7 +186,11 @@ class SwinBlock(nn.Module):
     def forward(self, x: torch.Tensor, H: int, W: int) -> torch.Tensor:
         """x: (B, H*W, C)"""
         B, _, C = x.shape
-        ws      = self.ws
+
+        # Clamp window size to actual feature map size — prevents shape
+        # mismatch when feature maps are smaller than the configured ws
+        # (e.g. stage 4 at 256px input: H=W=8 with ws=8 → only 1 window)
+        ws = min(self.ws, H, W)
 
         shortcut = x
         x = self.norm1(x).view(B, H, W, C)
@@ -184,8 +202,10 @@ class SwinBlock(nn.Module):
             x = F.pad(x, (0, 0, 0, pad_r, 0, pad_b))
         _, Hp, Wp, _ = x.shape
 
-        # Cyclic shift
-        if self.shift:
+        # Cyclic shift — only apply if feature map is larger than window
+        # (shift on a single-window map is a no-op and breaks the mask)
+        do_shift = self.shift and (Hp > ws or Wp > ws)
+        if do_shift:
             shift = ws // 2
             x = torch.roll(x, shifts=(-shift, -shift), dims=(1, 2))
             if self.attn_mask is None or self._mask_hw != (Hp, Wp):
@@ -201,7 +221,7 @@ class SwinBlock(nn.Module):
         x       = window_reverse(windows.view(-1, ws, ws, C), ws, Hp, Wp)
 
         # Reverse cyclic shift
-        if self.shift:
+        if do_shift:
             shift = ws // 2
             x = torch.roll(x, shifts=(shift, shift), dims=(1, 2))
 
