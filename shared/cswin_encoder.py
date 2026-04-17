@@ -155,9 +155,11 @@ class CSWinAttention(nn.Module):
     def forward(self, x: torch.Tensor, H: int, W: int) -> torch.Tensor:
         """x: (B, H*W, dim)"""
         B, N, C = x.shape
+        H_orig, W_orig = H, W
 
         # Clamp split_size to actual feature map dims
         sp = min(self.split_size, H, W)
+
         # Ensure H and W are divisible by sp — pad if needed
         pad_h = (sp - H % sp) % sp
         pad_w = (sp - W % sp) % sp
@@ -181,6 +183,13 @@ class CSWinAttention(nn.Module):
         out_v = self._stripe_attn(q_v, k_v, v_v, self.lepe_v, H, W, sp, horizontal=False)
 
         out = torch.cat([out_h, out_v], dim=-1)    # (B, H*W, dim)
+
+        # Crop back to original size if we padded
+        if pad_h or pad_w:
+            out = out.view(B, H, W, C)
+            out = out[:, :H_orig, :W_orig, :].contiguous()
+            out = out.view(B, H_orig * W_orig, C)
+
         return self.proj_drop(self.proj(out))
 
 
