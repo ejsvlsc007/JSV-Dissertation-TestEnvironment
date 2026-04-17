@@ -92,9 +92,10 @@ class CSWinAttention(nn.Module):
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj_drop = nn.Dropout(proj_drop)
 
-        # LePE for H and V groups
-        self.lepe_h = LePE(self.head_dim * self.half_heads)
-        self.lepe_v = LePE(self.head_dim * self.half_heads)
+        # LePE for H and V groups — built with head_dim since each head
+        # is processed independently (heads are merged into batch dim)
+        self.lepe_h = LePE(self.head_dim)
+        self.lepe_v = LePE(self.head_dim)
 
     def _stripe_attn(
         self,
