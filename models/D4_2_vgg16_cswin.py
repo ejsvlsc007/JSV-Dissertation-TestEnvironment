@@ -1,6 +1,9 @@
 """
 models/D4_2_vgg16_cswin.py
 D4_2 — vgg16 (pretrained) + CSwin Transformer (from scratch)
+
+embed_dim=32 → dims [32,64,128,256]
+num_heads must be even (H/V split) and divide dims → (2,4,8,16)
 """
 
 import torch.nn as nn
@@ -34,6 +37,7 @@ class D4_2(DualEncoderBase):
             embed_dim=32,
             drop_rate=cfg.get('drop_rate', 0.0),
             mlp_ratio=cfg.get('mlp_ratio', 4.0),
+            num_heads=(2, 4, 8, 16),   # even, divide dims evenly
         )
         DualEncoderBase.__init__(self, in_channels, img_size, **cfg)
 

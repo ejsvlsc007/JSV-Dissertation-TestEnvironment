@@ -1,6 +1,7 @@
 """
 models/D5_2_vgg19_cswin.py
 D5_2 — vgg19 (pretrained) + CSwin Transformer (from scratch)
+Same head fix as D4_2.
 """
 
 import torch.nn as nn
@@ -34,6 +35,7 @@ class D5_2(DualEncoderBase):
             embed_dim=32,
             drop_rate=cfg.get('drop_rate', 0.0),
             mlp_ratio=cfg.get('mlp_ratio', 4.0),
+            num_heads=(2, 4, 8, 16),
         )
         DualEncoderBase.__init__(self, in_channels, img_size, **cfg)
 

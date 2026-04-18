@@ -269,11 +269,31 @@ class SwinEncoder(nn.Module):
         embed_dim:   int   = 24,
         window_size: int   = 8,
         depths:      tuple = (2, 2, 6, 2),
-        num_heads:   tuple = (3, 6, 12, 24),
+        num_heads:   tuple = None,    # default computed from embed_dim below
         mlp_ratio:   float = 4.0,
         drop_rate:   float = 0.0,
     ):
         super().__init__()
+
+        # Auto-compute num_heads if not provided:
+        # pick the largest power-of-2 that divides embed_dim, up to 8
+        if num_heads is None:
+            base = min(8, embed_dim)
+            while embed_dim % base != 0:
+                base //= 2
+            num_heads = tuple(
+                min(base * (2 ** i), embed_dim * (2 ** i) // base)
+                for i in range(4)
+            )
+            # Simpler: just use base heads, doubling with dims
+            base_h = base
+            num_heads = (base_h, base_h * 2, base_h * 4, base_h * 8)
+            # Clamp so head_dim >= 4
+            num_heads = tuple(
+                max(1, min(nh, dims // 4))
+                for nh, dims in zip(num_heads,
+                                    [embed_dim * (2**i) for i in range(4)])
+            )
         self.patch_conv = nn.Conv2d(in_channels, embed_dim, kernel_size=4, stride=4)
         self.patch_norm = nn.LayerNorm(embed_dim)
         self.pos_drop   = nn.Dropout(drop_rate)

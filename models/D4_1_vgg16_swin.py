@@ -1,6 +1,9 @@
 """
 models/D4_1_vgg16_swin.py
 D4_1 — vgg16 (pretrained) + Swin Transformer (from scratch)
+
+embed_dim=64 → dims [64,128,256,512]
+num_heads must divide all dims → (8,8,16,32) all divide evenly
 """
 
 import torch.nn as nn
@@ -35,6 +38,7 @@ class D4_1(DualEncoderBase):
             window_size=cfg.get('window_size', 8),
             mlp_ratio=cfg.get('mlp_ratio', 4.0),
             drop_rate=cfg.get('drop_rate', 0.0),
+            num_heads=(8, 8, 16, 32),   # 64/8=8 ✓ 128/8=16 ✓ 256/16=16 ✓ 512/32=16 ✓
         )
         DualEncoderBase.__init__(self, in_channels, img_size, **cfg)
 
