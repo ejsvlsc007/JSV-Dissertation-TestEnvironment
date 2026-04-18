@@ -2,8 +2,9 @@
 models/D4_1_vgg16_swin.py
 D4_1 — vgg16 (pretrained) + Swin Transformer (from scratch)
 
-embed_dim=64 → dims [64,128,256,512]
-num_heads must divide all dims → (8,8,16,32) all divide evenly
+timm vgg16 out_indices=(1,2,3,4) actual channels: [128, 256, 512, 512]
+Swin embed_dim=64 → dims [64,128,256,512]
+num_heads=(8,16,32,32): 64/8=8 ✓ 128/16=8 ✓ 256/32=8 ✓ 512/32=16 ✓
 """
 
 import torch.nn as nn
@@ -15,13 +16,13 @@ MODEL_ID: str = "D4_1"
 
 
 class _CNNEncoder(nn.Module):
-    out_channels = [64, 128, 256, 512]
+    out_channels = [128, 256, 512, 512]   # actual timm vgg16 outputs
 
     def __init__(self, in_channels: int):
         super().__init__()
         self.backbone = timm.create_model(
             "vgg16", pretrained=True, features_only=True,
-            out_indices=(1,2,3,4), in_chans=in_channels,
+            out_indices=(1, 2, 3, 4), in_chans=in_channels,
         )
 
     def forward(self, x):
@@ -35,10 +36,10 @@ class D4_1(DualEncoderBase):
         self.transformer = SwinEncoder(
             in_channels=in_channels,
             embed_dim=64,
-            window_size=cfg.get('window_size', 8),
-            mlp_ratio=cfg.get('mlp_ratio', 4.0),
-            drop_rate=cfg.get('drop_rate', 0.0),
-            num_heads=(8, 8, 16, 32),   # 64/8=8 ✓ 128/8=16 ✓ 256/16=16 ✓ 512/32=16 ✓
+            window_size=cfg.get("window_size", 8),
+            mlp_ratio=cfg.get("mlp_ratio", 4.0),
+            drop_rate=cfg.get("drop_rate", 0.0),
+            num_heads=(8, 16, 32, 32),
         )
         DualEncoderBase.__init__(self, in_channels, img_size, **cfg)
 
