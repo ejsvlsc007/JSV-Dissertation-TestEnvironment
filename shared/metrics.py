@@ -50,6 +50,21 @@ def dice_coefficient(pred: torch.Tensor, target: torch.Tensor) -> float:
     return ((inter + SMOOTH) / (union + SMOOTH)).item()
 
 
+def iou_score(pred: torch.Tensor, target: torch.Tensor) -> float:
+    """
+    Intersection-over-Union on a batch. Threshold: 0.5.
+
+    Args:
+        pred:   FloatTensor (B, 1, H, W) — sigmoid probabilities.
+        target: FloatTensor (B, 1, H, W) — binary ground truth.
+    """
+    pred   = (pred > 0.5).float().view(-1)
+    target = target.view(-1)
+    inter  = (pred * target).sum()
+    union  = pred.sum() + target.sum() - inter
+    return ((inter + SMOOTH) / (union + SMOOTH)).item()
+
+
 def sensitivity(pred: torch.Tensor, target: torch.Tensor) -> float:
     """
     Sensitivity (Recall / True Positive Rate).
