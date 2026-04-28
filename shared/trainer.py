@@ -2,14 +2,12 @@
 shared/trainer.py
 =================
 Reusable training loop, validation loop, and CSV logger.
-Used identically by every model × fusion combination so that
-results are always directly comparable.
+Used identically by every model x fusion combination.
 
-Exports
--------
-train_epoch(model, loader, criterion, optimizer, device) → (loss, dice)
-validate(model, loader, criterion, device, compute_hd, hd_percentile) → (loss, dice, iou, jaccard, acc, hd)
-CSVLogger   — init / log_epoch / log_summary
+validate / validate_timed return order:
+    loss, dice, iou, sensitivity, specificity, precision,
+    accuracy, hausdorff, nsd
+    [+ elapsed, ms_per_image for timed variant]
 """
 
 import csv
@@ -24,9 +22,13 @@ from tqdm import tqdm
 from shared.metrics import (
     dice_coefficient,
     iou_score,
-    jaccard_score,
+    sensitivity,
+    specificity,
+    precision,
     pixel_accuracy,
     hausdorff_distance_batch,
+    nsd_batch,
+    get_model_size_mb,
 )
 
 
@@ -34,29 +36,14 @@ from shared.metrics import (
 # Training epoch
 # ---------------------------------------------------------------------------
 
-def train_epoch(
-    model: torch.nn.Module,
-    loader: torch.utils.data.DataLoader,
-    criterion: torch.nn.Module,
-    optimizer: torch.optim.Optimizer,
-    device: torch.device,
-) -> tuple[float, float]:
-    """
-    Run one full training epoch.
-
-    Handles both single-output models and deep-supervision models that
-    return a list/tuple of outputs (first element is the main output).
-
-    Returns:
-        mean_loss, mean_dice  over all batches.
-    """
+def train_epoch(model, loader, criterion, optimizer, device):
+    """Run one full training epoch. Returns (mean_loss, mean_dice)."""
     model.train()
     loss_sum, dice_sum = 0.0, 0.0
 
     for imgs, masks in tqdm(loader, desc="Training", leave=False):
         imgs, masks = imgs.to(device), masks.to(device)
         optimizer.zero_grad()
-
         out  = model(imgs)
         loss = criterion(out, masks)
         loss.backward()
@@ -76,36 +63,30 @@ def train_epoch(
 # ---------------------------------------------------------------------------
 
 def validate(
-    model: torch.nn.Module,
-    loader: torch.utils.data.DataLoader,
-    criterion: torch.nn.Module,
-    device: torch.device,
-    compute_hd: bool = False,
-    hd_percentile: int = 95,
-) -> tuple[float, float, float, float, float, float]:
+    model, loader, criterion, device,
+    compute_hd:    bool  = False,
+    compute_nsd:   bool  = False,
+    hd_percentile: int   = 95,
+    nsd_tolerance: float = 2.0,
+):
     """
-    Run inference on a DataLoader and return all evaluation metrics.
-
-    Args:
-        model:         trained (or in-training) model.
-        loader:        DataLoader for val or test split.
-        criterion:     loss function (same as training).
-        device:        cuda / cpu.
-        compute_hd:    whether to compute Hausdorff (expensive — skip most epochs).
-        hd_percentile: 95 for HD95, 100 for full Hausdorff.
+    Run inference and return all evaluation metrics.
 
     Returns:
-        loss, dice, iou, jaccard, accuracy, hausdorff
-        hausdorff is float('nan') when compute_hd=False.
+        loss, dice, iou, sensitivity, specificity, precision,
+        accuracy, hausdorff, nsd
+
+        hausdorff / nsd are float('nan') when not computed.
     """
     model.eval()
-    loss_sum = dice_sum = iou_sum = jac_sum = acc_sum = 0.0
-    hd_vals: list[float] = []
+    loss_sum = dice_sum = iou_sum = 0.0
+    sen_sum  = spe_sum = pre_sum = acc_sum = 0.0
+    hd_vals:  list[float] = []
+    nsd_vals: list[float] = []
 
     with torch.no_grad():
         for imgs, masks in loader:
             imgs, masks = imgs.to(device), masks.to(device)
-
             out  = model(imgs)
             loss = criterion(out, masks)
             loss_sum += loss.item()
@@ -115,50 +96,71 @@ def validate(
 
             dice_sum += dice_coefficient(pred, masks)
             iou_sum  += iou_score(pred, masks)
-            jac_sum  += jaccard_score(pred, masks)
+            sen_sum  += sensitivity(pred, masks)
+            spe_sum  += specificity(pred, masks)
+            pre_sum  += precision(pred, masks)
             acc_sum  += pixel_accuracy(pred, masks)
 
-            if compute_hd:
-                hd_vals.append(
-                    hausdorff_distance_batch(
-                        pred.cpu().numpy().squeeze(1),
-                        masks.cpu().numpy().squeeze(1),
-                        percentile=hd_percentile,
-                    )
-                )
+            if compute_hd or compute_nsd:
+                preds_np = pred.cpu().numpy().squeeze(1)
+                masks_np = masks.cpu().numpy().squeeze(1)
+                if compute_hd:
+                    hd_vals.append(hausdorff_distance_batch(
+                        preds_np, masks_np, percentile=hd_percentile))
+                if compute_nsd:
+                    nsd_vals.append(nsd_batch(
+                        preds_np, masks_np, tolerance=nsd_tolerance))
 
-    n  = len(loader)
-    hd = float(np.mean(hd_vals)) if hd_vals else float("nan")
-    return loss_sum / n, dice_sum / n, iou_sum / n, jac_sum / n, acc_sum / n, hd
+    n   = len(loader)
+    hd  = float(np.mean(hd_vals))  if hd_vals  else float("nan")
+    nsd = float(np.mean(nsd_vals)) if nsd_vals else float("nan")
+
+    return (
+        loss_sum / n,   # loss
+        dice_sum / n,   # dice
+        iou_sum  / n,   # iou
+        sen_sum  / n,   # sensitivity
+        spe_sum  / n,   # specificity
+        pre_sum  / n,   # precision
+        acc_sum  / n,   # accuracy
+        hd,             # hausdorff
+        nsd,            # nsd
+    )
 
 
 # ---------------------------------------------------------------------------
-# Timed wrappers  (return wall-clock seconds alongside the metrics)
+# Timed wrappers
 # ---------------------------------------------------------------------------
 
 def train_epoch_timed(model, loader, criterion, optimizer, device):
-    """train_epoch + wall-clock timing.  Returns (loss, dice, elapsed_s)."""
+    """Returns (loss, dice, elapsed_s)."""
     t0 = time.perf_counter()
     loss, dice = train_epoch(model, loader, criterion, optimizer, device)
     return loss, dice, time.perf_counter() - t0
 
 
-def validate_timed(model, loader, criterion, device, dataset_len,
-                   compute_hd=False, hd_percentile=95):
+def validate_timed(
+    model, loader, criterion, device, dataset_len,
+    compute_hd=False, compute_nsd=False,
+    hd_percentile=95, nsd_tolerance=2.0,
+):
     """
     validate + wall-clock timing.
 
     Returns:
-        loss, dice, iou, jaccard, acc, hd,
+        loss, dice, iou, sensitivity, specificity, precision,
+        accuracy, hausdorff, nsd,
         total_inference_s, ms_per_image
     """
-    t0 = time.perf_counter()
-    loss, dice, iou, jac, acc, hd = validate(
-        model, loader, criterion, device, compute_hd, hd_percentile
+    t0      = time.perf_counter()
+    results = validate(
+        model, loader, criterion, device,
+        compute_hd=compute_hd, compute_nsd=compute_nsd,
+        hd_percentile=hd_percentile, nsd_tolerance=nsd_tolerance,
     )
     elapsed = time.perf_counter() - t0
     ms_per  = (elapsed / dataset_len) * 1000 if dataset_len > 0 else float("nan")
-    return loss, dice, iou, jac, acc, hd, elapsed, ms_per
+    return (*results, elapsed, ms_per)
 
 
 # ---------------------------------------------------------------------------
@@ -168,75 +170,58 @@ def validate_timed(model, loader, criterion, device, dataset_len,
 _EPOCH_FIELDS = [
     "type", "timestamp", "epoch",
     "train_loss", "train_dice",
-    "val_loss", "val_dice", "val_iou", "val_jaccard", "val_accuracy", "val_hausdorff",
+    "val_loss", "val_dice", "val_iou",
+    "val_sensitivity", "val_specificity", "val_precision",
+    "val_accuracy", "val_hausdorff", "val_nsd",
     "val_inference_time_s", "inference_ms_per_image",
     "train_epoch_time_s", "total_training_time_s",
     "lr",
-    # run metadata (repeated every row for easy filtering in pandas)
     "model_id", "fusion_id", "image_size", "dataset_fraction",
     "batch_size", "total_epochs",
+    "model_size_mb",
 ]
 
 
 class CSVLogger:
-    """
-    Persistent per-run CSV logger.
-
-    Usage
-    -----
-        logger = CSVLogger(log_dir, run_id)
-        logger.init()                   # create file + header (call once per run)
-        logger.log_epoch(epoch, ...)    # call after every validation step
-        logger.log_summary(...)         # call once after training + test eval
-    """
+    """Persistent per-run CSV logger."""
 
     def __init__(self, log_dir: str, run_id: str):
         os.makedirs(log_dir, exist_ok=True)
-        self.path    = os.path.join(log_dir, f"{run_id}.csv")
-        self.run_id  = run_id
-        self._fields = _EPOCH_FIELDS
-
-    # ── Helpers ──────────────────────────────────────────────────────────────
+        self.path   = os.path.join(log_dir, f"{run_id}.csv")
+        self.run_id = run_id
 
     @staticmethod
     def _fmt(v) -> str:
-        """Format a float; return '-' for NaN."""
-        if isinstance(v, float) and v != v:   # NaN check
-            return "-"
-        if isinstance(v, float):
-            return f"{v:.6f}"
+        if isinstance(v, float) and v != v: return "-"
+        if isinstance(v, float): return f"{v:.6f}"
         return str(v)
 
     @staticmethod
     def _fmt4(v) -> str:
-        if isinstance(v, float) and v != v:
-            return "-"
+        if isinstance(v, float) and v != v: return "-"
         return f"{v:.4f}" if isinstance(v, float) else str(v)
 
-    # ── Public API ────────────────────────────────────────────────────────────
-
     def init(self):
-        """Create (or overwrite) the CSV file and write the header row."""
         with open(self.path, "w", newline="") as f:
-            csv.DictWriter(f, fieldnames=self._fields).writeheader()
+            csv.DictWriter(f, fieldnames=_EPOCH_FIELDS).writeheader()
 
     def log_epoch(
         self, *,
         epoch: int,
         tr_loss: float, tr_dice: float,
         va_loss: float, va_dice: float, va_iou: float,
-        va_jaccard: float, va_accuracy: float, va_hausdorff: float,
+        va_sensitivity: float, va_specificity: float, va_precision: float,
+        va_accuracy: float, va_hausdorff: float, va_nsd: float,
         val_inference_time_s: float, inference_ms_per_image: float,
         train_epoch_time_s: float, total_training_time_s: float,
         current_lr: float,
-        # run metadata
         model_id: str, fusion_id: str,
         image_size: int, dataset_fraction: float,
         batch_size: int, total_epochs: int,
+        model_size_mb: float = float("nan"),
     ):
-        """Append one epoch row."""
         with open(self.path, "a", newline="") as f:
-            csv.DictWriter(f, fieldnames=self._fields).writerow({
+            csv.DictWriter(f, fieldnames=_EPOCH_FIELDS).writerow({
                 "type":                   "epoch",
                 "timestamp":              datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "epoch":                  epoch,
@@ -245,9 +230,12 @@ class CSVLogger:
                 "val_loss":               self._fmt(va_loss),
                 "val_dice":               self._fmt(va_dice),
                 "val_iou":                self._fmt(va_iou),
-                "val_jaccard":            self._fmt(va_jaccard),
+                "val_sensitivity":        self._fmt(va_sensitivity),
+                "val_specificity":        self._fmt(va_specificity),
+                "val_precision":          self._fmt(va_precision),
                 "val_accuracy":           self._fmt(va_accuracy),
                 "val_hausdorff":          self._fmt4(va_hausdorff),
+                "val_nsd":                self._fmt4(va_nsd),
                 "val_inference_time_s":   self._fmt4(val_inference_time_s),
                 "inference_ms_per_image": self._fmt4(inference_ms_per_image),
                 "train_epoch_time_s":     self._fmt4(train_epoch_time_s),
@@ -259,61 +247,83 @@ class CSVLogger:
                 "dataset_fraction":       dataset_fraction,
                 "batch_size":             batch_size,
                 "total_epochs":           total_epochs,
+                "model_size_mb":          self._fmt4(model_size_mb),
             })
 
     def log_summary(
         self, *,
-        # best-val row
         best_val_dice: float, best_val_iou: float,
-        best_val_jaccard: float, best_val_accuracy: float,
-        best_val_hausdorff: float,
-        # mean-val row
+        best_val_sensitivity: float, best_val_specificity: float,
+        best_val_precision: float,
+        best_val_accuracy: float, best_val_hausdorff: float,
+        best_val_nsd: float,
         mean_val_dice: float, mean_val_iou: float,
-        mean_val_jaccard: float, mean_val_accuracy: float,
-        mean_val_hausdorff: float,
-        # test row
+        mean_val_sensitivity: float, mean_val_specificity: float,
+        mean_val_precision: float,
+        mean_val_accuracy: float, mean_val_hausdorff: float,
+        mean_val_nsd: float,
         test_dice: float, test_iou: float,
-        test_jaccard: float, test_accuracy: float,
-        test_hausdorff: float,
+        test_sensitivity: float, test_specificity: float,
+        test_precision: float,
+        test_accuracy: float, test_hausdorff: float,
+        test_nsd: float,
         test_inference_time_s: float = float("nan"),
         test_inference_ms_per_image: float = float("nan"),
         total_training_time_s: float = float("nan"),
-        # run metadata
+        model_size_mb: float = float("nan"),
         model_id: str = "", fusion_id: str = "",
         image_size: int = 0, dataset_fraction: float = 0.0,
         batch_size: int = 0, total_epochs: int = 0,
     ):
-        """Append best_val, mean_val, and test_final summary rows."""
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        meta = dict(
-            model_id=model_id, fusion_id=fusion_id,
-            image_size=image_size, dataset_fraction=dataset_fraction,
-            batch_size=batch_size, total_epochs=total_epochs,
-        )
+        ts   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        meta = dict(model_id=model_id, fusion_id=fusion_id,
+                    image_size=image_size, dataset_fraction=dataset_fraction,
+                    batch_size=batch_size, total_epochs=total_epochs)
+        nan  = float("nan")
+
+        def _row(label, dice, iou, sen, spe, pre, acc, hd, nsd,
+                 inf_s, inf_ms, tot_s, sz):
+            return {
+                "type": "summary", "timestamp": ts, "epoch": label,
+                "train_loss": "-", "train_dice": self._fmt(dice),
+                "val_loss": "-",
+                "val_dice":        self._fmt(dice),
+                "val_iou":         self._fmt(iou),
+                "val_sensitivity": self._fmt(sen),
+                "val_specificity": self._fmt(spe),
+                "val_precision":   self._fmt(pre),
+                "val_accuracy":    self._fmt(acc),
+                "val_hausdorff":   self._fmt4(hd),
+                "val_nsd":         self._fmt4(nsd),
+                "val_inference_time_s":   self._fmt4(inf_s),
+                "inference_ms_per_image": self._fmt4(inf_ms),
+                "train_epoch_time_s":     "-",
+                "total_training_time_s":  self._fmt4(tot_s),
+                "lr": "-",
+                "model_size_mb": self._fmt4(sz),
+                **meta,
+            }
+
         rows = [
-            ("best_val",   best_val_dice,  best_val_iou,  best_val_jaccard,  best_val_accuracy,  best_val_hausdorff,  float("nan"), float("nan"), float("nan"), float("nan")),
-            ("mean_val",   mean_val_dice,  mean_val_iou,  mean_val_jaccard,  mean_val_accuracy,  mean_val_hausdorff,  float("nan"), float("nan"), float("nan"), float("nan")),
-            ("test_final", test_dice,      test_iou,      test_jaccard,      test_accuracy,      test_hausdorff,      test_inference_time_s, test_inference_ms_per_image, float("nan"), total_training_time_s),
+            _row("best_val",
+                 best_val_dice, best_val_iou,
+                 best_val_sensitivity, best_val_specificity, best_val_precision,
+                 best_val_accuracy, best_val_hausdorff, best_val_nsd,
+                 nan, nan, nan, model_size_mb),
+            _row("mean_val",
+                 mean_val_dice, mean_val_iou,
+                 mean_val_sensitivity, mean_val_specificity, mean_val_precision,
+                 mean_val_accuracy, mean_val_hausdorff, mean_val_nsd,
+                 nan, nan, nan, model_size_mb),
+            _row("test_final",
+                 test_dice, test_iou,
+                 test_sensitivity, test_specificity, test_precision,
+                 test_accuracy, test_hausdorff, test_nsd,
+                 test_inference_time_s, test_inference_ms_per_image,
+                 total_training_time_s, model_size_mb),
         ]
+
         with open(self.path, "a", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=self._fields)
-            for label, dice, iou, jac, acc, hd, inf_s, inf_ms, ep_s, tot_s in rows:
-                w.writerow({
-                    "type":                   "summary",
-                    "timestamp":              ts,
-                    "epoch":                  label,
-                    "train_loss":             "-",
-                    "train_dice":             self._fmt(dice),
-                    "val_loss":               "-",
-                    "val_dice":               self._fmt(dice),
-                    "val_iou":                self._fmt(iou),
-                    "val_jaccard":            self._fmt(jac),
-                    "val_accuracy":           self._fmt(acc),
-                    "val_hausdorff":          self._fmt4(hd),
-                    "val_inference_time_s":   self._fmt4(inf_s),
-                    "inference_ms_per_image": self._fmt4(inf_ms),
-                    "train_epoch_time_s":     self._fmt4(ep_s),
-                    "total_training_time_s":  self._fmt4(tot_s),
-                    "lr":                     "-",
-                    **meta,
-                })
+            w = csv.DictWriter(f, fieldnames=_EPOCH_FIELDS)
+            for row in rows:
+                w.writerow(row)
