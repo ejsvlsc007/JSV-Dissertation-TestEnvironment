@@ -1,17 +1,10 @@
 """
 shared/dataset.py
 =================
-MCT-LTDiag N50 dataset loading, RAM caching, and splitting.
+MCT-LTDiag N100 dataset loading, RAM caching, and splitting.
 
-v2 — Fast parallel caching:
-  - Each NIfTI volume loaded exactly once per patient (was: once per slice)
-  - All slices from a volume processed as a numpy batch (no PIL loop)
-  - Patients cached in parallel via ThreadPoolExecutor
-  - Resize done with torch.nn.functional.interpolate on whole-volume
-    tensor — much faster than per-slice PIL resize
-  - gc.collect() removed from inner loop
-
-Speedup over v1: ~8-15x. Expected time for N=25: ~3-6 min on Colab.
+v3 — Updated to N100 (20 patients per category, 100 total)
+     Single zip: MCT-187D92-E20x5-S42_MCT-LTDiag_100.zip
 """
 
 import gc
@@ -29,7 +22,7 @@ from torch.utils.data import DataLoader, Subset, TensorDataset
 
 
 # ---------------------------------------------------------------------------
-# Patient manifest
+# Patient manifest — N100 (20 per category)
 # ---------------------------------------------------------------------------
 
 CATEGORY_LABELS: dict[str, int] = {
@@ -37,24 +30,44 @@ CATEGORY_LABELS: dict[str, int] = {
 }
 
 ALL_PATIENTS: dict[str, list[str]] = {
-    "HCC":  ["240504b28", "230525b5",  "230218b4",  "240504b42", "231109b01",
-             "230816b12", "230816b09", "230525b8",  "230525b4",  "240504b33"],
-    "ICC":  ["240122d70", "240122d45", "230906d02", "240122d51", "240112d31",
-             "230525d5",  "230525d4",  "231206d03", "231206d05", "240112d41"],
-    "HH":   ["240229c27", "230218c5",  "240229c20", "231025c09", "240229c41",
-             "240229c33", "240229c39", "240229c18", "240229c02", "231025c12"],
-    "BCLM": ["240620a07", "240620a25", "230408a13", "240620a53", "240620a62",
-             "230218a1",  "240620a47", "230312a11", "240620a39", "240620a04"],
-    "CRLM": ["240504e45", "240504e36", "240504e20", "240504e28", "240722e99",
-             "240504e14", "240504e12", "240504e50", "240504e13", "240504e47"],
+    "HCC": [
+        "230218b4",  "230218b5",  "230525b2",  "230525b4",  "230525b5",
+        "230525b8",  "230816b08", "230816b09", "230816b10", "230816b12",
+        "231109b01", "240504b01", "240504b11", "240504b16", "240504b18",
+        "240504b22", "240504b24", "240504b28", "240504b33", "240504b42",
+    ],
+    "ICC": [
+        "230525d1",  "230906d02", "230906d04", "230906d10", "230906d11",
+        "231206d01", "231206d03", "231206d04", "231206d12", "240112d11",
+        "240112d25", "240112d30", "240112d31", "240112d34", "240122d45",
+        "240122d51", "240122d59", "240122d65", "240122d67", "240122d73",
+    ],
+    "HH": [
+        "230218c7",  "230525c3",  "230525c5",  "230525c9",  "231025c08",
+        "231025c17", "231025c21", "231025c28", "231025c29", "231025c30",
+        "231025c32", "240229c07", "240229c17", "240229c19", "240229c23",
+        "240229c27", "240229c29", "240229c30", "240229c40", "240229c44",
+    ],
+    "BCLM": [
+        "230218a6",  "230218a9",  "230312a1",  "230312a11", "230312a3",
+        "230408a13", "230408a3",  "230408a6",  "230525a2",  "240504a10",
+        "240504a11", "240504a12", "240504a13", "240620a08", "240620a31",
+        "240620a34", "240620a48", "240620a57", "240620a60", "240620a61",
+    ],
+    "CRLM": [
+        "240504e10",  "240504e21",  "240504e22",  "240504e29",  "240504e32",
+        "240504e35",  "240504e43",  "240504e50",  "240722e100", "240722e61",
+        "240722e70",  "240722e73",  "240722e79",  "240722e83",  "240722e84",
+        "240722e87",  "240722e89",  "240722e90",  "240722e91",  "240722e95",
+    ],
 }
 
 REQUIRED_NIFTI  = ["nc.nii.gz", "art.nii.gz", "pvp.nii.gz"]
 REQUIRED_ROOT   = ["mask_pvp.nii.gz"]
 MCT_FUSION_MASK = "mask_pvp.nii.gz"
 
-_LO: float = 60.0 - 150.0 / 2   # -15 HU
-_HI: float = 60.0 + 150.0 / 2   # +135 HU
+_LO: float = 60.0 - 150.0 / 2
+_HI: float = 60.0 + 150.0 / 2
 
 
 # ---------------------------------------------------------------------------
@@ -122,7 +135,7 @@ def build_raw_slices(extract_dir, verified_pids):
 
 
 # ---------------------------------------------------------------------------
-# Core fast per-patient cacher (runs in thread pool)
+# Core fast per-patient cacher
 # ---------------------------------------------------------------------------
 
 def _window_volume(vol):
@@ -134,18 +147,8 @@ def _window_volume(vol):
 def _cache_one_patient(patient_root, entries, image_size,
                        imgs_out, masks_out, lock, print_lock,
                        p_idx, n_patients):
-    """
-    Load 4 NIfTI volumes once, process all slices as batched tensor ops.
-
-    Optimisations vs v1:
-      1. nib.load called 4x total (not 4x per slice)
-      2. Windowing on full 3-D numpy array (vectorised)
-      3. Resize via F.interpolate on (N, C, H, W) — one call for all slices
-      4. No PIL used at all
-    """
     pr = Path(patient_root)
 
-    # Load all volumes once
     nc_vol  = _window_volume(nib.load(str(pr / "NIFTI" / "nc.nii.gz" )).get_fdata())
     art_vol = _window_volume(nib.load(str(pr / "NIFTI" / "art.nii.gz")).get_fdata())
     pvp_vol = _window_volume(nib.load(str(pr / "NIFTI" / "pvp.nii.gz")).get_fdata())
@@ -154,17 +157,14 @@ def _cache_one_patient(patient_root, entries, image_size,
     slice_ids  = [s for _, s in entries]
     global_ids = [g for g, _ in entries]
 
-    # Extract all slices at once: NIfTI is (H,W,Z) -> transpose to (N,H,W)
     nc_s  = nc_vol [:, :, slice_ids].transpose(2, 0, 1)
     art_s = art_vol[:, :, slice_ids].transpose(2, 0, 1)
     pvp_s = pvp_vol[:, :, slice_ids].transpose(2, 0, 1)
     msk_s = msk_vol[:, :, slice_ids].transpose(2, 0, 1)
 
-    # Stack phases -> (N, 3, H, W)
     imgs_t  = torch.from_numpy(np.stack([nc_s, art_s, pvp_s], axis=1))
-    masks_t = torch.from_numpy(msk_s[:, None, :, :])  # (N, 1, H, W)
+    masks_t = torch.from_numpy(msk_s[:, None, :, :])
 
-    # Batched resize — one call for all slices
     H, W = imgs_t.shape[2], imgs_t.shape[3]
     if H != image_size or W != image_size:
         imgs_t  = F.interpolate(imgs_t,  size=(image_size, image_size),
@@ -174,7 +174,6 @@ def _cache_one_patient(patient_root, entries, image_size,
 
     masks_t = (masks_t > 0.5).float()
 
-    # Write into pre-allocated output lists (thread-safe)
     with lock:
         for i, gid in enumerate(global_ids):
             imgs_out[gid]  = imgs_t[i]
@@ -186,7 +185,7 @@ def _cache_one_patient(patient_root, entries, image_size,
 
 
 # ---------------------------------------------------------------------------
-# Step 3 — build_cached_dataset  (parallel fast path)
+# Step 3 — build_cached_dataset
 # ---------------------------------------------------------------------------
 
 def build_cached_dataset(
@@ -196,22 +195,6 @@ def build_cached_dataset(
     verbose=True,
     num_workers=4,
 ):
-    """
-    Pre-load all slices into RAM tensors.
-
-    Fast path (load_fn=None): parallel patient loading with batched ops.
-    Compatibility path (load_fn provided): sequential per-slice loading (v1).
-
-    Args:
-        slice_index:  list from build_raw_slices()
-        load_fn:      if None, uses fast path. If provided, uses v1 path.
-        image_size:   spatial size (square).
-        verbose:      print progress.
-        num_workers:  parallel patient threads (default 4, try 8 for more cores).
-
-    Returns:
-        TensorDataset(imgs (N,3,H,W), masks (N,1,H,W))
-    """
     patient_entries = defaultdict(list)
     for global_idx, (pr, s, _) in enumerate(slice_index):
         patient_entries[pr].append((global_idx, s))
@@ -228,7 +211,6 @@ def build_cached_dataset(
               f"({num_workers} parallel workers)...")
 
     if load_fn is None:
-        # Fast parallel path
         with ThreadPoolExecutor(max_workers=num_workers) as executor:
             futures = {}
             for p_idx, (patient_root, entries) in enumerate(
@@ -250,7 +232,6 @@ def build_cached_dataset(
                         f"Failed on {Path(futures[f]).name}: {exc}"
                     ) from exc
     else:
-        # Compatibility path: use provided load_fn sequentially
         for p_idx, (patient_root, entries) in enumerate(
             sorted(patient_entries.items())
         ):
@@ -317,7 +298,7 @@ def patient_level_split(slice_index, test_frac=0.20, val_frac=0.20, seed=42):
 # ---------------------------------------------------------------------------
 
 def make_dataloaders(cached_ds, train_idx, val_idx, test_idx,
-                     batch_size=16, num_workers=4):
+                     batch_size=16, num_workers=0):
     pw = num_workers > 0
     pf = 2 if num_workers > 0 else None
 
